@@ -75,6 +75,7 @@ def _eagle_prefill_tail_tokens(
                 break
     return tail_tokens
 
+
 def organize_draft_results(
     score_list: List[torch.Tensor],
     token_list: List[torch.Tensor],
@@ -756,7 +757,7 @@ def eagle_sample(
     num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
-    if sampling_info.is_all_greedy or _is_npu or _is_hip:
+    if sampling_info.is_all_greedy or _is_npu or _is_hip or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
