@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.speculative.triton_ops.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
@@ -170,7 +171,7 @@ def sgl_build_tree_kernel_efficient_pytorch(
                     parent_tb_idx = int(selected_index[batch_idx][i - 1]) // topk
                     parent_position = 0
                     found_parent = parent_tb_idx == 0
-                    if parent_tb_idx > 0:
+                    if parent_tb_idx > 0 and parent_tb_idx < parent_list.shape[1]:
                         parent_token_idx = parent_list[batch_idx][parent_tb_idx]
                         while parent_position < draft_token_num - 1:
                             if (
@@ -207,6 +208,9 @@ def sgl_build_tree_kernel_efficient_pytorch(
                     tree_mask[token_tree_idx + cur_position] = True
                     parent_tb_idx = int(selected_index[batch_idx][cur_position]) // topk
                     if parent_tb_idx == 0:
+                        break
+
+                    if parent_tb_idx >= parent_list.shape[1]:
                         break
 
                     parent_token_idx = parent_list[batch_idx][parent_tb_idx]
@@ -314,36 +318,13 @@ def build_tree_kernel_efficient(
             tree_mask_mode,
         )
     elif _is_xpu:
-        # Try Triton implementation first, fallback to PyTorch if not available
+        # Try JIT SYCL implementation first, then Triton, finally fallback to PyTorch
         try:
-            sgl_build_tree_kernel_triton(
-                parent_list,
-                top_scores_index,
-                seq_lens,
-                tree_mask,
-                positions,
-                retrieve_index,
-                retrieve_next_token,
-                retrieve_next_sibling,
-                topk,
-                spec_steps,
-                num_verify_tokens,
-                tree_mask_mode,
+            from sglang.jit_kernel.eagle_tree_xpu import (
+                sgl_build_tree_kernel_efficient_xpu,
             )
-        except (AttributeError, RuntimeError):
-            # Reinitialize buffers to original state in case Triton partially corrupted them
-            if tree_mask_mode == TreeMaskMode.QLEN_ONLY:
-                tree_mask.fill_(True)
-            elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
-                tree_mask.fill_(0)
-            elif tree_mask_mode == TreeMaskMode.FULL_MASK:
-                tree_mask.fill_(True)
-            retrieve_index.fill_(-1)
-            retrieve_next_token.fill_(-1)
-            retrieve_next_sibling.fill_(-1)
 
-            # Fallback to PyTorch implementation
-            sgl_build_tree_kernel_efficient_pytorch(
+            sgl_build_tree_kernel_efficient_xpu(
                 parent_list,
                 top_scores_index,
                 seq_lens,
@@ -356,7 +337,53 @@ def build_tree_kernel_efficient(
                 spec_steps,
                 num_verify_tokens,
                 tree_mask_mode,
+                optimized=envs.SGLANG_OPT_USE_XPU_EAGLE_TREE_KERNEL.get(),
             )
+        except Exception as e:
+            logger.warning(f"XPU JIT kernel failed, trying Triton: {e}")
+            try:
+                sgl_build_tree_kernel_triton(
+                    parent_list,
+                    top_scores_index,
+                    seq_lens,
+                    tree_mask,
+                    positions,
+                    retrieve_index,
+                    retrieve_next_token,
+                    retrieve_next_sibling,
+                    topk,
+                    spec_steps,
+                    num_verify_tokens,
+                    tree_mask_mode,
+                )
+            except (AttributeError, RuntimeError):
+                # Reinitialize buffers to original state in case Triton partially corrupted them
+                if tree_mask_mode == TreeMaskMode.QLEN_ONLY:
+                    tree_mask.fill_(True)
+                elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
+                    tree_mask.fill_(0)
+                elif tree_mask_mode == TreeMaskMode.FULL_MASK:
+                    tree_mask.fill_(True)
+                retrieve_index.fill_(-1)
+                retrieve_next_token.fill_(-1)
+                retrieve_next_sibling.fill_(-1)
+
+                # Fallback to PyTorch implementation
+                logger.warning("Triton also failed, falling back to PyTorch")
+                sgl_build_tree_kernel_efficient_pytorch(
+                    parent_list,
+                    top_scores_index,
+                    seq_lens,
+                    tree_mask,
+                    positions,
+                    retrieve_index,
+                    retrieve_next_token,
+                    retrieve_next_sibling,
+                    topk,
+                    spec_steps,
+                    num_verify_tokens,
+                    tree_mask_mode,
+                )
     else:
         sgl_build_tree_kernel_efficient(
             parent_list,
@@ -553,25 +580,11 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
     elif _is_xpu:
-        # Try Triton implementation first, fallback to PyTorch if not available
+        # Try JIT SYCL implementation first, then Triton, finally fallback to PyTorch
         try:
-            verify_tree_greedy_triton(
-                predicts=predicts,
-                accept_index=accept_index,
-                accept_token_num=accept_token_num,
-                candidates=candidates,
-                retrive_index=retrieve_index,
-                retrive_next_token=retrieve_next_token,
-                retrive_next_sibling=retrieve_next_sibling,
-                target_predict=target_predict,
-            )
-        except (AttributeError, RuntimeError):
-            # Reinitialize buffers to original state in case Triton partially corrupted them
-            accept_index.fill_(-1)
-            accept_token_num.fill_(0)
+            from sglang.jit_kernel.eagle_tree_xpu import verify_tree_greedy_xpu
 
-            # Fallback to PyTorch implementation
-            verify_tree_greedy_pytorch(
+            verify_tree_greedy_xpu(
                 predicts=predicts,
                 accept_index=accept_index,
                 accept_token_num=accept_token_num,
@@ -580,7 +593,38 @@ def verify_tree_greedy_func(
                 retrive_next_token=retrieve_next_token,
                 retrive_next_sibling=retrieve_next_sibling,
                 target_predict=target_predict,
+                optimized=envs.SGLANG_OPT_USE_XPU_EAGLE_TREE_KERNEL.get(),
             )
+        except Exception as e:
+            logger.warning(f"XPU JIT kernel failed, trying Triton: {e}")
+            try:
+                verify_tree_greedy_triton(
+                    predicts=predicts,
+                    accept_index=accept_index,
+                    accept_token_num=accept_token_num,
+                    candidates=candidates,
+                    retrive_index=retrieve_index,
+                    retrive_next_token=retrieve_next_token,
+                    retrive_next_sibling=retrieve_next_sibling,
+                    target_predict=target_predict,
+                )
+            except (AttributeError, RuntimeError):
+                # Reinitialize buffers to original state in case Triton partially corrupted them
+                accept_index.fill_(-1)
+                accept_token_num.fill_(0)
+
+                # Fallback to PyTorch implementation
+                logger.warning("Triton also failed, falling back to PyTorch")
+                verify_tree_greedy_pytorch(
+                    predicts=predicts,
+                    accept_index=accept_index,
+                    accept_token_num=accept_token_num,
+                    candidates=candidates,
+                    retrive_index=retrieve_index,
+                    retrive_next_token=retrieve_next_token,
+                    retrive_next_sibling=retrieve_next_sibling,
+                    target_predict=target_predict,
+                )
     return predicts, accept_index, accept_token_num
 
 

@@ -62,7 +62,7 @@ def sgl_build_tree_kernel_efficient_triton(
 
         if parent_tb_idx == 0:
             found = 1
-        else:
+        elif parent_tb_idx < parent_list_stride:
             parent_token_idx = tl.load(
                 parent_list_ptr + batch_idx * parent_list_stride + parent_tb_idx
             )
@@ -136,6 +136,8 @@ def sgl_build_tree_kernel_efficient_triton(
                     )
                     if parent_tb_idx == 0:
                         should_continue = 0
+                    elif parent_tb_idx >= parent_list_stride:
+                        should_continue = 0
                     else:
                         parent_token_idx = tl.load(
                             parent_list_ptr
@@ -157,6 +159,10 @@ def sgl_build_tree_kernel_efficient_triton(
                                 ):
                                     cur_position = cp
                                     found = 1
+
+                        # Match PyTorch: stop walking if parent not found
+                        if found == 0:
+                            should_continue = 0
 
             tl.store(
                 positions_ptr + batch_idx * draft_token_num + draft_token_idx,

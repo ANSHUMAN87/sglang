@@ -639,6 +639,11 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # Use the re-parallelized XPU SYCL EAGLE tree kernels (build_tree / verify):
+    # one work-group per batch element with SLM staging and int32 division,
+    # instead of the scalar one-work-item-per-batch path. Off by default; opt in
+    # once parity is validated on the target Intel GPU.
+    SGLANG_OPT_USE_XPU_EAGLE_TREE_KERNEL = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
