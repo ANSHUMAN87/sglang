@@ -265,12 +265,45 @@ def run_build_tree_benchmark(
     draft_token_nums: List[int],
     implementations: dict,
 ):
-    """Benchmark build_tree kernel: CUDA vs Triton."""
+    """Benchmark build_tree kernel: CUDA vs Triton.
+
+    Each (topk, depth) pair is chosen so that
+    sum(topk**i for i in range(depth)) == draft_token_num exactly,
+    keeping the tree structure valid and avoiding the "invalid eagle tree"
+    warning that fires when parent indices fall outside parent_list bounds.
+    """
     from sglang.srt.speculative.eagle_utils import TreeMaskMode
 
     device = "cuda"
-    topk, depth = 2, 3
     tree_mask_mode = TreeMaskMode.QLEN_ONLY
+
+    # Map draft_token_num -> (topk, depth) for a valid EAGLE tree.
+    # Formula: sum(topk**i for i in range(depth)) == draft_token_num
+    #   7  = 1+2+4       -> topk=2, depth=3
+    #   21 = 1+4+16      -> topk=4, depth=3
+    #   31 = 1+2+4+8+16  -> topk=2, depth=5
+    #   73 = 1+8+64      -> topk=8, depth=3
+    #   85 = 1+4+16+64   -> topk=4, depth=4
+    _TREE_PARAMS = {
+        7:  (2, 3),
+        21: (4, 3),
+        31: (2, 5),
+        73: (8, 3),
+        85: (4, 4),
+    }
+
+    def _tree_params(draft_token_num):
+        if draft_token_num in _TREE_PARAMS:
+            return _TREE_PARAMS[draft_token_num]
+        # Fallback: find a valid (topk, depth) pair, or use topk=2
+        for topk in [2, 4, 8]:
+            for depth in range(2, 8):
+                if sum(topk**i for i in range(depth)) == draft_token_num:
+                    return topk, depth
+        # No exact match — use topk=2 and warn once
+        import math
+        depth = max(2, round(math.log(draft_token_num, 2)))
+        return 2, depth
 
     print("\n" + "=" * 80)
     print("BENCHMARKING: build_tree kernel (CUDA vs Triton)")
@@ -278,8 +311,10 @@ def run_build_tree_benchmark(
 
     for batch_size in batch_sizes:
         for draft_token_num in draft_token_nums:
+            topk, depth = _tree_params(draft_token_num)
             print(
                 f"\nConfig: batch_size={batch_size}, draft_token_num={draft_token_num}"
+                f"  (topk={topk}, depth={depth})"
             )
 
             parent_list, selected_index, verified_seq_len = make_valid_tree_inputs(
@@ -607,14 +642,16 @@ def main():
         return 1
 
     # Configure benchmark
+    # draft_token_nums are chosen to match real EAGLE tree sizes so that
+    # (topk, depth) can be derived exactly — no "invalid eagle tree" warnings.
     if args.quick:
-        batch_sizes = [2, 8]
-        draft_token_nums = [4, 8]
+        batch_sizes = [1, 8]
+        draft_token_nums = [7, 21]      # topk=2/depth=3, topk=4/depth=3
         warmup_iters = 5
         measure_iters = 50
     else:
         batch_sizes = [1, 2, 4, 8, 16, 32]
-        draft_token_nums = [4, 8, 12, 16]
+        draft_token_nums = [7, 21, 73, 85]   # common EAGLE configs
         warmup_iters = 10
         measure_iters = 100
 
