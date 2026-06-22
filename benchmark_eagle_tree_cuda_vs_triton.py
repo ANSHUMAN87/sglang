@@ -92,12 +92,12 @@ class BenchmarkRunner:
         self.results.append(result)
 
     def print_summary(self):
-        """Print benchmark summary table (CUDA baseline, Triton speedup)."""
+        """Print benchmark summary table (CUDA baseline, all Triton speedups)."""
         print("\n" + "=" * 110)
-        print("PERFORMANCE SUMMARY (CUDA vs Triton)")
+        print("PERFORMANCE SUMMARY (CUDA vs Triton / Triton v1 / Triton v2)")
         print("=" * 110)
         print(
-            f"{'Kernel':<14} {'Impl':<10} {'Batch':<8} {'Tokens':<8} "
+            f"{'Kernel':<14} {'Impl':<12} {'Batch':<8} {'Tokens':<8} "
             f"{'Mean (us)':<12} {'Median (us)':<14} {'Speedup vs CUDA':<16}"
         )
         print("-" * 110)
@@ -108,21 +108,26 @@ class BenchmarkRunner:
             key = (r.name, r.batch_size, r.draft_tokens)
             kernels.setdefault(key, {})[r.implementation] = r
 
+        display_names = {
+            "cuda":      "CUDA",
+            "triton":    "Triton",
+            "triton_v1": "Triton v1",
+            "triton_v2": "Triton v2",
+        }
+
         for (name, batch, tokens), impls in sorted(kernels.items()):
             cuda_r = impls.get("cuda")
             baseline_us = cuda_r.median_us if cuda_r else None
 
-            for impl_name in ["cuda", "triton"]:
-                display_name = {"cuda": "CUDA", "triton": "Triton"}[impl_name]
+            for impl_name in ["cuda", "triton", "triton_v1", "triton_v2"]:
                 if impl_name not in impls:
                     continue
                 r = impls[impl_name]
                 speedup_str = ""
-                if baseline_us:
-                    speedup = baseline_us / r.median_us
-                    speedup_str = f"{speedup:.2f}x"
+                if baseline_us and impl_name != "cuda":
+                    speedup_str = f"{baseline_us / r.median_us:.2f}x"
                 print(
-                    f"{name:<14} {display_name:<10} {batch:<8} {tokens:<8} "
+                    f"{name:<14} {display_names[impl_name]:<12} {batch:<8} {tokens:<8} "
                     f"{r.mean_us:<12.2f} {r.median_us:<14.2f} {speedup_str:<16}"
                 )
 
@@ -190,7 +195,7 @@ def make_valid_tree_inputs(batch_size, draft_token_num, topk, device):
 
 def check_implementations():
     """Check which implementations are available."""
-    impls = {"cuda": False, "triton": False}
+    impls = {"cuda": False, "triton": False, "triton_v1": False, "triton_v2": False}
 
     try:
         from sgl_kernel import build_tree_kernel_efficient  # noqa: F401
@@ -207,6 +212,26 @@ def check_implementations():
         )
 
         impls["triton"] = True
+    except Exception:
+        pass
+
+    try:
+        from sglang.srt.speculative.triton_ops.spec_tree_optimized import (  # noqa: F401
+            sgl_build_tree_kernel_optimized_v1,
+            verify_tree_greedy_kernel_optimized_v1,
+        )
+
+        impls["triton_v1"] = True
+    except Exception:
+        pass
+
+    try:
+        from sglang.srt.speculative.triton_ops.spec_tree_optimized import (  # noqa: F401
+            sgl_build_tree_kernel_optimized_v2,
+            verify_tree_greedy_kernel_optimized_v2,
+        )
+
+        impls["triton_v2"] = True
     except Exception:
         pass
 
@@ -288,7 +313,7 @@ def run_build_tree_benchmark(
                 runner.add_result(result)
                 print(f"  CUDA:    {result.median_us:.2f} us (median)")
 
-            # Benchmark Triton
+            # Benchmark Triton (baseline)
             if implementations["triton"]:
                 from sglang.srt.speculative.eagle_utils import (
                     sgl_build_tree_kernel_triton,
@@ -314,7 +339,70 @@ def run_build_tree_benchmark(
                 result.batch_size = batch_size
                 result.draft_tokens = draft_token_num
                 runner.add_result(result)
-                print(f"  Triton:  {result.median_us:.2f} us (median)")
+                print(f"  Triton:    {result.median_us:.2f} us (median)")
+
+            # Shared setup for Triton v1/v2 (need explicit prefix sums)
+            if implementations["triton_v1"] or implementations["triton_v2"]:
+                seq_len_prefix_sum = torch.zeros_like(verified_seq_len)
+                if batch_size > 1:
+                    seq_len_prefix_sum[1:] = torch.cumsum(
+                        verified_seq_len[:-1], dim=0
+                    )
+                grid = (batch_size,)
+                pl_stride = parent_list.shape[1]
+                si_stride = selected_index.shape[1]
+
+            # Benchmark Triton v1
+            if implementations["triton_v1"]:
+                from sglang.srt.speculative.triton_ops.spec_tree_optimized import (
+                    sgl_build_tree_kernel_optimized_v1,
+                )
+
+                outputs = _build_tree_outputs(
+                    batch_size, draft_token_num, tree_mask_size, device
+                )
+
+                fn = lambda: sgl_build_tree_kernel_optimized_v1[grid](
+                    parent_list, selected_index, verified_seq_len,
+                    seq_len_prefix_sum, *outputs,
+                    topk=topk, depth=depth, draft_token_num=draft_token_num,
+                    tree_mask_mode=int(tree_mask_mode), batch_size=batch_size,
+                    parent_list_stride=pl_stride,
+                    selected_index_stride=si_stride,
+                )
+
+                result = runner.benchmark_function(fn, "build_tree")
+                result.implementation = "triton_v1"
+                result.batch_size = batch_size
+                result.draft_tokens = draft_token_num
+                runner.add_result(result)
+                print(f"  Triton v1: {result.median_us:.2f} us (median)")
+
+            # Benchmark Triton v2
+            if implementations["triton_v2"]:
+                from sglang.srt.speculative.triton_ops.spec_tree_optimized import (
+                    sgl_build_tree_kernel_optimized_v2,
+                )
+
+                outputs = _build_tree_outputs(
+                    batch_size, draft_token_num, tree_mask_size, device
+                )
+
+                fn = lambda: sgl_build_tree_kernel_optimized_v2[grid](
+                    parent_list, selected_index, verified_seq_len,
+                    seq_len_prefix_sum, *outputs,
+                    topk=topk, depth=depth, draft_token_num=draft_token_num,
+                    tree_mask_mode=int(tree_mask_mode), batch_size=batch_size,
+                    parent_list_stride=pl_stride,
+                    selected_index_stride=si_stride,
+                )
+
+                result = runner.benchmark_function(fn, "build_tree")
+                result.implementation = "triton_v2"
+                result.batch_size = batch_size
+                result.draft_tokens = draft_token_num
+                runner.add_result(result)
+                print(f"  Triton v2: {result.median_us:.2f} us (median)")
 
 
 def _verify_tree_inputs(batch_size, num_draft_tokens, vocab_size, device):
@@ -408,7 +496,7 @@ def run_verify_tree_benchmark(
                 runner.add_result(result)
                 print(f"  CUDA:    {result.median_us:.2f} us (median)")
 
-            # Benchmark Triton
+            # Benchmark Triton (baseline)
             if implementations["triton"]:
                 from sglang.srt.speculative.eagle_utils import (
                     verify_tree_greedy_triton,
@@ -430,7 +518,55 @@ def run_verify_tree_benchmark(
                 result.batch_size = batch_size
                 result.draft_tokens = num_draft_tokens
                 runner.add_result(result)
-                print(f"  Triton:  {result.median_us:.2f} us (median)")
+                print(f"  Triton:    {result.median_us:.2f} us (median)")
+
+            grid = (batch_size,)
+
+            # Benchmark Triton v1
+            if implementations["triton_v1"]:
+                from sglang.srt.speculative.triton_ops.spec_tree_optimized import (
+                    verify_tree_greedy_kernel_optimized_v1,
+                )
+
+                outputs = _verify_tree_outputs(batch_size, num_draft_tokens, device)
+
+                fn = lambda: verify_tree_greedy_kernel_optimized_v1[grid](
+                    *outputs, candidates, retrive_index,
+                    retrive_next_token, retrive_next_sibling, target_predict,
+                    batch_size=batch_size,
+                    num_speculative_tokens=num_draft_tokens,
+                    num_draft_tokens=num_draft_tokens,
+                )
+
+                result = runner.benchmark_function(fn, "verify_tree")
+                result.implementation = "triton_v1"
+                result.batch_size = batch_size
+                result.draft_tokens = num_draft_tokens
+                runner.add_result(result)
+                print(f"  Triton v1: {result.median_us:.2f} us (median)")
+
+            # Benchmark Triton v2
+            if implementations["triton_v2"]:
+                from sglang.srt.speculative.triton_ops.spec_tree_optimized import (
+                    verify_tree_greedy_kernel_optimized_v2,
+                )
+
+                outputs = _verify_tree_outputs(batch_size, num_draft_tokens, device)
+
+                fn = lambda: verify_tree_greedy_kernel_optimized_v2[grid](
+                    *outputs, candidates, retrive_index,
+                    retrive_next_token, retrive_next_sibling, target_predict,
+                    batch_size=batch_size,
+                    num_speculative_tokens=num_draft_tokens,
+                    num_draft_tokens=num_draft_tokens,
+                )
+
+                result = runner.benchmark_function(fn, "verify_tree")
+                result.implementation = "triton_v2"
+                result.batch_size = batch_size
+                result.draft_tokens = num_draft_tokens
+                runner.add_result(result)
+                print(f"  Triton v2: {result.median_us:.2f} us (median)")
 
 
 def main():
@@ -447,7 +583,7 @@ def main():
 
     print("=" * 80)
     print("EAGLE TREE KERNEL PERFORMANCE BENCHMARK")
-    print("CUDA (sgl-kernel) vs Triton")
+    print("CUDA (sgl-kernel) vs Triton / Triton v1 / Triton v2")
     print("=" * 80)
 
     # Check device
@@ -461,11 +597,13 @@ def main():
     # Check implementations
     impls = check_implementations()
     print("\n📦 Available implementations:")
-    print(f"  {'CUDA:':<12} {'✓' if impls['cuda'] else '✗ (sgl_kernel missing)'}")
-    print(f"  {'Triton:':<12} {'✓' if impls['triton'] else '✗'}")
+    print(f"  {'CUDA:':<14} {'✓' if impls['cuda'] else '✗ (sgl_kernel missing)'}")
+    print(f"  {'Triton:':<14} {'✓' if impls['triton'] else '✗'}")
+    print(f"  {'Triton v1:':<14} {'✓' if impls['triton_v1'] else '✗'}")
+    print(f"  {'Triton v2:':<14} {'✓' if impls['triton_v2'] else '✗'}")
 
-    if not impls["cuda"] and not impls["triton"]:
-        print("\n❌ Neither CUDA nor Triton implementation is importable. Aborting.")
+    if not any(impls.values()):
+        print("\n❌ No implementations are importable. Aborting.")
         return 1
 
     # Configure benchmark

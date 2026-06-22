@@ -5,7 +5,9 @@ Standalone Performance Benchmark: SYCL JIT vs SYCL JIT (optimized) vs Triton
 Comprehensive performance comparison of EAGLE tree kernel implementations:
 - SYCL JIT (native XPU with icpx compilation, scalar kernel)
 - SYCL JIT opt (re-parallelized SYCL kernel, optimized=True)
-- Triton (Triton-based kernels)
+- Triton (baseline Triton-based kernels)
+- Triton v1 (optimized Triton kernels - moderate optimization)
+- Triton v2 (optimized Triton kernels - aggressive optimization)
 
 Usage:
     python benchmark_eagle_tree_xpu.py [--quick] [--csv output.csv] [--plot]
@@ -110,11 +112,13 @@ class BenchmarkRunner:
             baseline_r = impls.get("sycl_jit")
             baseline_us = baseline_r.median_us if baseline_r else None
 
-            for impl_name in ["sycl_jit", "sycl_jit_opt", "triton"]:
+            for impl_name in ["sycl_jit", "sycl_jit_opt", "triton", "triton_v1", "triton_v2"]:
                 display_name = {
                     "sycl_jit": "SYCL JIT",
                     "sycl_jit_opt": "SYCL JIT opt",
                     "triton": "Triton",
+                    "triton_v1": "Triton v1",
+                    "triton_v2": "Triton v2",
                 }[impl_name]
 
                 if impl_name in impls:
@@ -202,6 +206,8 @@ def check_implementations():
         "sycl_jit": False,
         "sycl_jit_opt": False,
         "triton": False,
+        "triton_v1": False,
+        "triton_v2": False,
     }
 
     try:
@@ -220,6 +226,24 @@ def check_implementations():
         from sglang.srt.speculative.eagle_utils import sgl_build_tree_kernel_triton
 
         impls["triton"] = True
+    except Exception:
+        pass
+
+    try:
+        from sglang.srt.speculative.triton_ops.spec_tree_optimized import (
+            sgl_build_tree_kernel_optimized_v1,
+        )
+
+        impls["triton_v1"] = True
+    except Exception:
+        pass
+
+    try:
+        from sglang.srt.speculative.triton_ops.spec_tree_optimized import (
+            sgl_build_tree_kernel_optimized_v2,
+        )
+
+        impls["triton_v2"] = True
     except Exception:
         pass
 
@@ -343,7 +367,7 @@ def run_build_tree_benchmark(
                 runner.add_result(result)
                 print(f"  SYCL JIT (opt): {result.median_us:.2f} us (median)")
 
-            # Benchmark Triton
+            # Benchmark Triton (baseline)
             if implementations["triton"]:
                 from sglang.srt.speculative.eagle_utils import (
                     sgl_build_tree_kernel_triton,
@@ -384,6 +408,112 @@ def run_build_tree_benchmark(
                 result.draft_tokens = draft_token_num
                 runner.add_result(result)
                 print(f"  Triton:    {result.median_us:.2f} us (median)")
+
+            # Benchmark Triton v1 (optimized - moderate)
+            if implementations["triton_v1"]:
+                from sglang.srt.speculative.triton_ops.spec_tree_optimized import (
+                    sgl_build_tree_kernel_optimized_v1,
+                )
+
+                outputs = (
+                    torch.full(
+                        (tree_mask_size,), True, dtype=torch.bool, device=device
+                    ),
+                    torch.zeros(
+                        (batch_size * draft_token_num,), dtype=torch.int64, device=device
+                    ),
+                    torch.full(
+                        (batch_size, draft_token_num), -1, dtype=torch.int64, device=device
+                    ),
+                    torch.full(
+                        (batch_size, draft_token_num), -1, dtype=torch.int64, device=device
+                    ),
+                    torch.full(
+                        (batch_size, draft_token_num), -1, dtype=torch.int64, device=device
+                    ),
+                )
+
+                # Compute prefix sums
+                seq_len_prefix_sum = torch.zeros_like(verified_seq_len)
+                if batch_size > 1:
+                    seq_len_prefix_sum[1:] = torch.cumsum(verified_seq_len[:-1], dim=0)
+
+                grid = (batch_size,)
+
+                fn = lambda: sgl_build_tree_kernel_optimized_v1[grid](
+                    parent_list,
+                    selected_index,
+                    verified_seq_len,
+                    seq_len_prefix_sum,
+                    *outputs,
+                    topk=topk,
+                    depth=depth,
+                    draft_token_num=draft_token_num,
+                    tree_mask_mode=tree_mask_mode.value,
+                    batch_size=batch_size,
+                    parent_list_stride=parent_list.shape[1],
+                    selected_index_stride=selected_index.shape[1],
+                )
+
+                result = runner.benchmark_function(fn, "build_tree")
+                result.implementation = "triton_v1"
+                result.batch_size = batch_size
+                result.draft_tokens = draft_token_num
+                runner.add_result(result)
+                print(f"  Triton v1: {result.median_us:.2f} us (median)")
+
+            # Benchmark Triton v2 (optimized - aggressive)
+            if implementations["triton_v2"]:
+                from sglang.srt.speculative.triton_ops.spec_tree_optimized import (
+                    sgl_build_tree_kernel_optimized_v2,
+                )
+
+                outputs = (
+                    torch.full(
+                        (tree_mask_size,), True, dtype=torch.bool, device=device
+                    ),
+                    torch.zeros(
+                        (batch_size * draft_token_num,), dtype=torch.int64, device=device
+                    ),
+                    torch.full(
+                        (batch_size, draft_token_num), -1, dtype=torch.int64, device=device
+                    ),
+                    torch.full(
+                        (batch_size, draft_token_num), -1, dtype=torch.int64, device=device
+                    ),
+                    torch.full(
+                        (batch_size, draft_token_num), -1, dtype=torch.int64, device=device
+                    ),
+                )
+
+                # Compute prefix sums
+                seq_len_prefix_sum = torch.zeros_like(verified_seq_len)
+                if batch_size > 1:
+                    seq_len_prefix_sum[1:] = torch.cumsum(verified_seq_len[:-1], dim=0)
+
+                grid = (batch_size,)
+
+                fn = lambda: sgl_build_tree_kernel_optimized_v2[grid](
+                    parent_list,
+                    selected_index,
+                    verified_seq_len,
+                    seq_len_prefix_sum,
+                    *outputs,
+                    topk=topk,
+                    depth=depth,
+                    draft_token_num=draft_token_num,
+                    tree_mask_mode=tree_mask_mode.value,
+                    batch_size=batch_size,
+                    parent_list_stride=parent_list.shape[1],
+                    selected_index_stride=selected_index.shape[1],
+                )
+
+                result = runner.benchmark_function(fn, "build_tree")
+                result.implementation = "triton_v2"
+                result.batch_size = batch_size
+                result.draft_tokens = draft_token_num
+                runner.add_result(result)
+                print(f"  Triton v2: {result.median_us:.2f} us (median)")
 
 
 def run_verify_tree_benchmark(
@@ -508,7 +638,7 @@ def run_verify_tree_benchmark(
                 runner.add_result(result)
                 print(f"  SYCL JIT (opt): {result.median_us:.2f} us (median)")
 
-            # Benchmark Triton
+            # Benchmark Triton (baseline)
             if implementations["triton"]:
                 from sglang.srt.speculative.eagle_utils import (
                     verify_tree_greedy_triton,
@@ -545,6 +675,90 @@ def run_verify_tree_benchmark(
                 runner.add_result(result)
                 print(f"  Triton:    {result.median_us:.2f} us (median)")
 
+            # Benchmark Triton v1 (optimized - moderate)
+            if implementations["triton_v1"]:
+                from sglang.srt.speculative.triton_ops.spec_tree_optimized import (
+                    verify_tree_greedy_kernel_optimized_v1,
+                )
+
+                outputs = (
+                    torch.zeros(
+                        (batch_size * num_draft_tokens),
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    torch.full(
+                        (batch_size, num_draft_tokens),
+                        -1,
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    torch.zeros((batch_size,), dtype=torch.int32, device=device),
+                )
+
+                grid = (batch_size,)
+
+                fn = lambda: verify_tree_greedy_kernel_optimized_v1[grid](
+                    *outputs,
+                    candidates,
+                    retrive_index,
+                    retrive_next_token,
+                    retrive_next_sibling,
+                    target_predict,
+                    batch_size=batch_size,
+                    num_speculative_tokens=num_draft_tokens,
+                    num_draft_tokens=num_draft_tokens,
+                )
+
+                result = runner.benchmark_function(fn, "verify_tree")
+                result.implementation = "triton_v1"
+                result.batch_size = batch_size
+                result.draft_tokens = num_draft_tokens
+                runner.add_result(result)
+                print(f"  Triton v1: {result.median_us:.2f} us (median)")
+
+            # Benchmark Triton v2 (optimized - aggressive)
+            if implementations["triton_v2"]:
+                from sglang.srt.speculative.triton_ops.spec_tree_optimized import (
+                    verify_tree_greedy_kernel_optimized_v2,
+                )
+
+                outputs = (
+                    torch.zeros(
+                        (batch_size * num_draft_tokens),
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    torch.full(
+                        (batch_size, num_draft_tokens),
+                        -1,
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    torch.zeros((batch_size,), dtype=torch.int32, device=device),
+                )
+
+                grid = (batch_size,)
+
+                fn = lambda: verify_tree_greedy_kernel_optimized_v2[grid](
+                    *outputs,
+                    candidates,
+                    retrive_index,
+                    retrive_next_token,
+                    retrive_next_sibling,
+                    target_predict,
+                    batch_size=batch_size,
+                    num_speculative_tokens=num_draft_tokens,
+                    num_draft_tokens=num_draft_tokens,
+                )
+
+                result = runner.benchmark_function(fn, "verify_tree")
+                result.implementation = "triton_v2"
+                result.batch_size = batch_size
+                result.draft_tokens = num_draft_tokens
+                runner.add_result(result)
+                print(f"  Triton v2: {result.median_us:.2f} us (median)")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -563,7 +777,7 @@ def main():
 
     print("=" * 80)
     print("EAGLE TREE KERNEL PERFORMANCE BENCHMARK")
-    print("SYCL JIT vs SYCL JIT (optimized) vs Triton")
+    print("SYCL JIT vs SYCL JIT (optimized) vs Triton (baseline/v1/v2)")
     print("=" * 80)
 
     # Check device
@@ -579,6 +793,8 @@ def main():
     print(f"  {'SYCL JIT:':<15} {'✓' if impls['sycl_jit'] else '✗'}")
     print(f"  {'SYCL JIT opt:':<15} {'✓' if impls['sycl_jit_opt'] else '✗'}")
     print(f"  {'Triton:':<15} {'✓' if impls['triton'] else '✗ (optional)'}")
+    print(f"  {'Triton v1:':<15} {'✓ (optimized)' if impls['triton_v1'] else '✗ (optional)'}")
+    print(f"  {'Triton v2:':<15} {'✓ (optimized)' if impls['triton_v2'] else '✗ (optional)'}")
 
     if not impls["sycl_jit"]:
         print(
